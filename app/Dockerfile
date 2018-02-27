@@ -1,8 +1,8 @@
 FROM python:3.6-alpine
-LABEL authors="John Anderson <lampwins@gmail.com>"
+LABEL authors="John Anderson <lampwins@gmail.com>, Zach Hilliard <zach.hilliard@cyxtera.com"
 
 # Environment
-ENV TZ="America/New_York"
+ENV TZ="America/Chicago"
 
 # System Prep
 RUN apk add --update \

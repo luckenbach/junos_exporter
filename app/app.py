@@ -1,14 +1,11 @@
 from jnpr.junos import Device
-from lxml import etree
 import re
-from cgi import escape, parse_qs
-import json
 import yaml
 import logging
+import falcon
 
 
-logger = logging.getLogger(__name__)
-
+#logger = logging.getLogger(__name__).addHandler(logging.StreamHandler())
 config = None
 
 
@@ -45,8 +42,6 @@ class Metrics(object):
         if self._metrics_registry.get(name) is None:
             self._metrics_registry[name] = []
             self._metric_types[name] = metric_type
-        else:
-            raise ValueError('Metric named {} is already registered.'.format(name))
 
     def add_metric(self, name, value, labels=None):
         """
@@ -70,34 +65,14 @@ class Metrics(object):
         return "\n".join([str(x) for x in lines]) + '\n'
 
 
-def hello(environ, start_response):
-    """Like the example above, but it uses the name specified in the
-URL."""
-    # get the name from the url if it was specified there.
-    args = environ['myapp.url_args']
-    if args:
-        subject = escape(args[0])
-    else:
-        subject = 'World'
-    start_response('200 OK', [('Content-Type', 'text/html')])
-    return ['''Hello %(subject)s
-            Hello %(subject)s!
-
-''' % {'subject': subject}]
-
-def not_found(environ, start_response):
-    """Called if no URL matches."""
-    start_response('404 NOT FOUND', [('Content-Type', 'text/plain')])
-    return [bytes('Not Found', 'utf-8')]
-
-
 def get_interface_metrics(registry, dev):
     """
     Get interface metrics
     """
 
     # interfaces
-    interface_information = dev.rpc.get_interface_information(extensive=True)
+    interface_information = dev.rpc.get_interface_information(terse=True)
+    #interface_information = dev.rpc.get_interface_information(extensive=True)
 
     # register interface metrics
     registry.register('ifaceInputBps', 'gauge')
@@ -560,7 +535,17 @@ def metrics(environ, start_response):
     parameters = parse_qs(environ.get('QUERY_STRING', ''))
 
     # get profile from config
-    profile = config[parameters['module'][0]]
+    try:
+        profile = config[parameters['module'][0]]
+    except KeyError as e:
+        # start response
+        data = 'all is well'
+        status = '200 OK'
+        response_headers = [
+            ('Content-type', 'text/plain'),
+        ]
+        start_response(status, response_headers)
+        return [bytes(data, 'utf-8')]
 
     # open device connection
     if profile['auth']['method'] == 'password':
@@ -574,7 +559,9 @@ def metrics(environ, start_response):
                      user=profile['auth']['username'],
                      password=profile['auth'].get('password'),
                      ssh_private_key_file='./ssh_private_key_file')
+
     dev.open()
+    dev.timeout = 60
 
     # create metrics registry
     registry = Metrics()
@@ -605,27 +592,73 @@ def metrics(environ, start_response):
     return [bytes(data, 'utf-8')]
 
 
-# map urls to functions
-urls = [
-    #(r'metrics$', self_service),
-    #(r'metrics/$', self_service),
-    (r'metrics/?$', metrics),
-    (r'metrics/(.+)$', metrics)
-]
+class RenderMetrics:
+    def on_get(self, req, resp):
+        resp.content_type = falcon.MEDIA_TEXT
 
-def app(environ, start_response):
-    """
-    The main WSGI application. Dispatch the current request to
-    the functions from above and store the regular expression
-    captures in the WSGI environment as  `myapp.url_args` so that
-    the functions from above can access the url placeholders.
+        # Get our victim
+        target = req.get_param('target')
+        module = req.get_param('module')
 
-    If nothing matches call the `not_found` function.
-    """
-    path = environ.get('PATH_INFO', '').lstrip('/')
-    for regex, callback in urls:
-        match = re.search(regex, path)
-        if match is not None:
-            environ['app.url_args'] = match.groups()
-            return callback(environ, start_response)
-    return not_found(environ, start_response)
+        # Make sure the needful is present
+        if target is None or module is None:
+            resp.status_code = 400
+            resp.content_type = falcon.MEDIA_JSON
+            resp.media = {'Error': 'All required parameters are not defined'}
+            return
+        #logger.info('Got request for {0} using module {1}'.format(target, module))
+        # Read our config
+        with open('./junos_exporter.yaml', 'r') as f:
+            config = yaml.load(f)
+
+
+        # Check to see if we have this module configured
+        try:
+            profile = config[module]
+        except KeyError as e:
+            resp.status_code = 400
+            resp.content_type = falcon.MEDIA_JSON
+            resp.media = {'Error': 'We do not have a module called: {0}'.format(module)}
+            return resp
+
+        # open device connection
+        if profile['auth']['method'] == 'password':
+            dev = Device(host=target,
+                         user=profile['auth']['username'],
+                         password=profile['auth']['password'])
+        elif profile['auth']['method'] == 'ssh_key':
+            dev = Device(host=target,
+                         user=profile['auth']['username'],
+                         password=profile['auth'].get('password'),
+                         ssh_private_key_file='./ssh_private_key_file')
+
+
+        dev.open()
+        dev.timeout = 60
+
+        # create metrics registry
+        registry = Metrics()
+
+        # get and parse metrics
+        types = profile['metrics']
+        if 'interface' in types:
+            get_interface_metrics(registry, dev)
+        if 'environment' in types:
+            get_environment_metrics(registry, dev)
+        if 'virtual_chassis' in types:
+            get_virtual_chassis_metrics(registry, dev)
+        if 'routing_engine' in types:
+            get_route_engine_metrics(registry, dev)
+        if 'storage' in types:
+            get_storage_metrics(registry, dev)
+        if 'bgp' in types:
+            get_bgp_metrics(registry, dev)
+
+       # start response
+        resp.body = registry.collect()
+        return resp
+
+
+
+api = falcon.API()
+api.add_route('/metrics', RenderMetrics())

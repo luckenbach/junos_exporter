@@ -1,4 +1,4 @@
 junos-eznc
-gunicorn
-json-logging-py
 eventlet
+falcon
+gunicorn
